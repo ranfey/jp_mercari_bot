@@ -6,6 +6,7 @@ import requests
 import urllib
 import random
 import queue
+import sys
 
 from PIL import Image
 from selenium import webdriver
@@ -20,9 +21,6 @@ from win11toast import toast
 import tkinter as tk
 from tkinter import ttk
 
-# ----------------------------------------
-# 1) 全局变量/配置
-# ----------------------------------------
 # 全局停止事件：一旦设置，就会要求所有线程停止
 stop_event = threading.Event()
 
@@ -37,8 +35,9 @@ text_widgets = {}
 
 # Selenium Chrome配置
 chrome_options = Options()
-chrome_options.add_argument("--headless")  # 无头模式
+chrome_options.add_argument("--headless=new")  # 无头模式
 chrome_options.add_argument("--disable-gpu")
+chrome_options.add_argument("--blink-settings=imagesEnabled=false")  # 禁用图片加载
 chrome_options.add_argument("--no-sandbox")
 chrome_options.add_argument("--disable-dev-shm-usage")
 chrome_options.add_argument("--log-level=3")
@@ -50,10 +49,6 @@ chrome_options.add_argument(
 )
 
 
-# ----------------------------------------
-# 2) 日志打印的封装：替代 print()
-#    把 (search, message) 写入队列，GUI主线程再显示
-# ----------------------------------------
 def log_print(search, *args):
     """
     模拟 print() 的效果，把要打印的文本组合起来，
@@ -63,13 +58,19 @@ def log_print(search, *args):
     log_queue.put((search, message))
 
 
-# ----------------------------------------
-# 3) 原有下载、通知、检测逻辑
-#    只需把 print(...) 全改为 log_print(...)
-# ----------------------------------------
+def get_base_dir():
+    if getattr(sys, "frozen", False):
+        # 如果是打包后的 exe，返回 exe 所在目录
+        return os.path.dirname(sys.executable)
+    else:
+        # 否则是源码运行，返回当前 .py 文件所在目录
+        return os.path.dirname(os.path.abspath(__file__))
+
+
+# 图象缓存处理
 def download_image(image_url, search):
     try:
-        temp_dir = os.path.join(search, "temp")
+        temp_dir = os.path.join(get_base_dir() + "/" + search, "temp")
         os.makedirs(temp_dir, exist_ok=True)
 
         original_name = (
@@ -123,12 +124,14 @@ def download_image(image_url, search):
         return None
 
 
+# 构造系统消息
 def send_toast_notification(title, message, image, link, search):
     image_path = download_image(image, search)
     imagere = {"src": image_path, "placement": "hero"}
     toast(title, message, image=imagere, on_click=link)
 
 
+# 页面加载判断
 def get_redirected_url(driver, search):
     try:
         WebDriverWait(driver, 15).until(EC.url_contains("search_condition_id="))
@@ -138,40 +141,43 @@ def get_redirected_url(driver, search):
         return None
 
 
-def all_images_loaded(driver, search):
-    img_elements = driver.find_elements(
-        By.CSS_SELECTOR, ".imageContainer__f8ddf3a2 img"
-    )
-    loaded_count = sum(
-        1
-        for img in img_elements
-        if img.get_attribute("src") and "https" in img.get_attribute("src")
-    )
-    log_print(search, f"✅ 已加载 {loaded_count}/{len(img_elements)} 张图片")
-    return loaded_count == len(img_elements)
+# 模拟滑动加载
+def scroll_until_all_loaded(driver, search):
+    scroll_pause_time = 0.3
+    while True:
+        # 滚动到底部（强制）
+        driver.execute_script("window.scrollBy(0, 2000);")
+        time.sleep(scroll_pause_time)
+        if (
+            len(driver.find_elements(By.CSS_SELECTOR, ".merItemThumbnail"))
+            >= len(driver.find_elements(By.CSS_SELECTOR, '[data-testid="item-cell"]'))
+            and len(driver.find_elements(By.CSS_SELECTOR, '[data-testid="item-cell"]'))
+            != 0
+        ):
+            log_print(search, "✅ 商品列表加载完成~")
+            break
 
 
-# ----------------------------------------
-# 4) 监控核心线程函数
-# ----------------------------------------
+# 主循环
 def get_search_url(search, stop_event, min_delay, max_delay):
-    """
-    传入一个搜索关键词 search 和一个停止事件 stop_event，
-    不断刷新获取新商品信息。
-    """
-    # 初始化 WebDriver
     driver = webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
         options=chrome_options,
     )
-    base_url = f"https://jp.mercari.com/search?keyword={search}"
-    driver.get(base_url)
-    search_url = get_redirected_url(driver, search) or base_url
+    driver.set_window_size(888, 5000)
+    # 启用 CDP
+    driver.execute_cdp_cmd("Network.enable", {})
+    # 设置请求拦截规则
+    driver.execute_cdp_cmd(
+        "Network.setBlockedURLs",
+        {"urls": ["*.css", "*.woff", "*.ttf"]},
+    )
+    search_url = f"https://jp.mercari.com/search?keyword={urllib.parse.quote(search)}&sort=created_time&order=desc"
 
     while not stop_event.is_set():
         # 读取旧数据
-        os.makedirs(search, exist_ok=True)
-        json_path = os.path.join(search, "mercari_data.json")
+        os.makedirs(get_base_dir() + "/" + search, exist_ok=True)
+        json_path = os.path.join(get_base_dir(), search, "mercari_data.json")
         if os.path.exists(json_path):
             with open(json_path, "r", encoding="utf-8") as f:
                 old_items = json.load(f)
@@ -182,73 +188,52 @@ def get_search_url(search, stop_event, min_delay, max_delay):
 
         old_item_ids = {item["id"] for item in old_items}
         old_items_dict = {item["id"]: item for item in old_items}
-
+        #########################################################################
         try:
             log_print(search, f"\n(=^･ω･^=) 刷新页面，嗅探新商品…")
             driver.get(search_url)
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.CLASS_NAME, "merItemThumbnail"))
-            )
-
-            # 等待图片加载
-            try:
-                WebDriverWait(driver, 15).until(
-                    EC.presence_of_all_elements_located(
-                        (By.CLASS_NAME, "imageContainer__f8ddf3a2")
-                    )
-                )
-                WebDriverWait(driver, 15).until(lambda d: all_images_loaded(d, search))
-                log_print(search, f"✅ 所有图片都加载完成啦(≧∇≦)/")
-            except Exception as e:
-                log_print(search, f"⚠️图片加载失败，可能网络卡住: {e}")
-                continue
-
-            current_search_url = get_redirected_url(driver, search)
-            search_url = current_search_url if current_search_url else base_url
-
             # 检查并设置排序方式
             try:
-                select_element = WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CLASS_NAME, "select__da4764db"))
-                )
+                select_element = WebDriverWait(driver, 5)
                 select = Select(select_element)
                 current_value = select.first_selected_option.get_attribute("value")
                 if current_value != "created_time:desc":
                     log_print(search, f"🔄 切换排序方式为最新(๑>ᴗ<๑)")
                     select.select_by_value("created_time:desc")
-                    WebDriverWait(driver, 5).until(EC.staleness_of(select_element))
-                    WebDriverWait(driver, 10).until(
-                        lambda d: all_images_loaded(d, search)
-                    )
                 else:
                     log_print(search, f"✅ 已经是最新排序啦~")
             except Exception as e:
-                log_print(search)
+                log_print(search, f"✅ 已经是最新排序啦~")  # 不管了（倒下）
+            scroll_until_all_loaded(driver, search)
+            items = driver.find_elements(By.CSS_SELECTOR, 'li[data-testid="item-cell"]')
+            ittms = driver.find_elements(By.CSS_SELECTOR, ".merItemThumbnail")
 
-            # 获取所有商品信息
-            items = driver.find_elements(By.CLASS_NAME, "merItemThumbnail")
+            log_print(search, f"📦 共发现 {len(items)} 个商品块")
+            log_print(search, f"📦 实际加载 {len(ittms)} 个商品块")
+
+            # 替换原搜索链接
+            current_search_url = get_redirected_url(driver, search)
+            search_url = current_search_url if current_search_url else search_url
+
             new_items = []
+
+            # 读取新数据
 
             for item in items:
                 try:
-                    item_id = item.get_attribute("id")
-                    name_element = item.find_element(
-                        By.CLASS_NAME, "itemName__a6f874a2"
-                    )
-                    item_name = name_element.text
-
-                    price_element = item.find_element(By.CLASS_NAME, "number__6b270ca7")
-                    item_price = price_element.text
-
-                    img_element = item.find_element(
-                        By.CSS_SELECTOR, ".imageContainer__f8ddf3a2 img"
-                    )
+                    thumb_div = item.find_element(By.CSS_SELECTOR, ".merItemThumbnail")
+                    item_id = thumb_div.get_attribute("id")
+                    item_price = item.find_element(
+                        By.CSS_SELECTOR, ".number__6b270ca7"
+                    ).text.strip()
+                    img_element = item.find_element(By.CSS_SELECTOR, "img")
                     img_url = img_element.get_attribute("src")
-
-                    link_element = item.find_element(
-                        By.XPATH, "./ancestor::a[@data-testid='thumbnail-link']"
-                    )
-                    item_link = link_element.get_attribute("href")
+                    item_link = item.find_element(
+                        By.CSS_SELECTOR, 'a[data-testid="thumbnail-link"]'
+                    ).get_attribute("href")
+                    item_name = item.find_element(
+                        By.CSS_SELECTOR, ".imageContainer__f8ddf3a2"
+                    ).get_attribute("aria-label")
 
                     new_items.append(
                         {
@@ -260,7 +245,7 @@ def get_search_url(search, stop_event, min_delay, max_delay):
                         }
                     )
                 except Exception as e:
-                    log_print(search)
+                    continue
 
             new_item_ids = {item["id"] for item in new_items}
             added_items = [item for item in new_items if item["id"] not in old_item_ids]
@@ -330,9 +315,6 @@ def get_search_url(search, stop_event, min_delay, max_delay):
     log_print(search, f"监控线程已结束。")
 
 
-# ----------------------------------------
-# 5) GUI 主窗口
-# ----------------------------------------
 class MercariGUI(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -414,7 +396,7 @@ class MercariGUI(tk.Tk):
                     max_delay = 1.00
                     log_print(
                         search,
-                        "⚠️杂鱼主人，这样输入的时间间隔才不对啦，我直接用0.05到1.00秒了哦！",
+                        "⚠️主人，这样输入的时间间隔才不对啦，我直接用0.05到1.00秒了哦！",
                     )
                 # 创建并启动该关键词的线程
                 t = threading.Thread(
@@ -427,7 +409,7 @@ class MercariGUI(tk.Tk):
 
     def stop_all(self):
         """
-        一键停止所有子线程：设置 stop_event
+        设置 stop_event
         """
         stop_event.set()
         # 也可以在这里等待线程结束
@@ -481,9 +463,6 @@ class MercariGUI(tk.Tk):
         self.destroy()
 
 
-# ----------------------------------------
-# 6) 入口
-# ----------------------------------------
 if __name__ == "__main__":
     app = MercariGUI()
     app.protocol("WM_DELETE_WINDOW", app.on_closing)
