@@ -37,7 +37,7 @@ text_widgets = {}
 
 # Selenium Chrome配置
 chrome_options = Options()
-# chrome_options.add_argument("--headless")  # 无头模式
+chrome_options.add_argument("--headless")  # 无头模式
 chrome_options.add_argument("--disable-gpu")
 chrome_options.add_argument("--no-sandbox")
 chrome_options.add_argument("--disable-dev-shm-usage")
@@ -154,7 +154,7 @@ def all_images_loaded(driver, search):
 # ----------------------------------------
 # 4) 监控核心线程函数
 # ----------------------------------------
-def get_search_url(search, stop_event):
+def get_search_url(search, stop_event, min_delay, max_delay):
     """
     传入一个搜索关键词 search 和一个停止事件 stop_event，
     不断刷新获取新商品信息。
@@ -311,12 +311,17 @@ def get_search_url(search, stop_event):
                         log_print(search, f"⚠️价格转换失败: {e}")
 
             with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(new_items, f, ensure_ascii=False, indent=4)
+                json.dump(
+                    list({d["id"]: d for d in old_items + new_items}.values()),
+                    f,
+                    ensure_ascii=False,
+                    indent=4,
+                )
 
         except Exception as e:
-            log_print(search, f"❌发生错误")
+            log_print(search, f"❌发生错误，也许是网络问题呢？绝对不是本喵的错！")
 
-        delay = random.uniform(0.05, 1.00)
+        delay = random.uniform(min_delay, max_delay)
         log_print(search, f"下次检查将在 {delay} 秒后…\n")
         time.sleep(delay)
 
@@ -331,8 +336,17 @@ def get_search_url(search, stop_event):
 class MercariGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Mercari 多线程监控示例")
+        self.title("Mercari监控")
         self.geometry("900x600")
+        # 底部区域
+        down_frame = tk.Frame(self)
+        down_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
+        tk.Label(down_frame, text="最小间隔(秒):").pack(side=tk.LEFT)
+        self.entry_min_delay = tk.Entry(down_frame, width=10)
+        self.entry_min_delay.pack(side=tk.LEFT, padx=5)
+        tk.Label(down_frame, text="最大间隔(秒):").pack(side=tk.LEFT)
+        self.entry_max_delay = tk.Entry(down_frame, width=10)
+        self.entry_max_delay.pack(side=tk.LEFT, padx=5)
 
         # 顶部区域：添加关键词 + 按钮
         top_frame = tk.Frame(self)
@@ -390,9 +404,23 @@ class MercariGUI(tk.Tk):
         for search in text_widgets.keys():
             stop_event.clear()
             if search not in monitor_threads:
+                try:
+                    min_delay = float(self.entry_min_delay.get().strip())
+                    max_delay = float(self.entry_max_delay.get().strip())
+                    if min_delay > max_delay:
+                        min_delay, max_delay = max_delay, min_delay
+                except ValueError:
+                    min_delay = 0.05
+                    max_delay = 1.00
+                    log_print(
+                        search,
+                        "⚠️杂鱼主人，这样输入的时间间隔才不对啦，我直接用0.05到1.00秒了哦！",
+                    )
                 # 创建并启动该关键词的线程
                 t = threading.Thread(
-                    target=get_search_url, args=(search, stop_event), daemon=True
+                    target=get_search_url,
+                    args=(search, stop_event, min_delay, max_delay),
+                    daemon=True,
                 )
                 monitor_threads[search] = t
                 t.start()
